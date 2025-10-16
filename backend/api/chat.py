@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import os
 import time
+import json
+import hashlib
 
 try:
     # Prefer official OpenAI SDK v1 style
@@ -25,20 +26,23 @@ class ChatResponse(BaseModel):
     cached: bool = False
 
 
-app = FastAPI(title="ThreatVeil Backend", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.getenv("CORS_ORIGINS", "http://localhost:3000")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+router = APIRouter()
 
 
 # Simple in-memory TTL cache for early cost control
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL_SECONDS = int(os.getenv("GPT_CACHE_TTL_SECONDS", "3600"))
+
+# Optional Redis cache (preferred for efficiency)
+_redis_client = None
+try:
+    import redis  # type: ignore
+
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        _redis_client = redis.StrictRedis.from_url(redis_url, decode_responses=True)
+except Exception:
+    _redis_client = None
 
 
 def _get_openai_client():
@@ -51,12 +55,21 @@ def _get_openai_client():
 
 
 def _cache_key(message: str) -> str:
-    # Minimal key (can add session_id/context later)
-    return f"chat:{hash(message)}"
+    h = hashlib.md5(message.encode("utf-8")).hexdigest()
+    return f"chat:{h}"
 
 
 def _get_cached(message: str) -> Optional[Dict[str, Any]]:
     key = _cache_key(message)
+    if _redis_client:
+        cached = _redis_client.get(key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                return None
+        return None
+    # Fallback in-memory cache
     entry = _CACHE.get(key)
     if not entry:
         return None
@@ -68,6 +81,9 @@ def _get_cached(message: str) -> Optional[Dict[str, Any]]:
 
 def _set_cached(message: str, value: Dict[str, Any]) -> None:
     key = _cache_key(message)
+    if _redis_client:
+        _redis_client.setex(key, _CACHE_TTL_SECONDS, json.dumps(value))
+        return
     _CACHE[key] = {"ts": time.time(), "value": value}
 
 
@@ -83,7 +99,7 @@ def _select_model(message: str) -> str:
     return os.getenv("OPENAI_MODEL_FULL", "gpt-4o")
 
 
-@app.post("/api/v2/chat/message", response_model=ChatResponse)
+@router.post("/api/v2/chat/message", response_model=ChatResponse)
 async def chat_message(req: ChatRequest):
     # Cache first
     cached = _get_cached(req.message)
@@ -117,15 +133,33 @@ async def chat_message(req: ChatRequest):
         content = response.choices[0].message.content or ""
         tokens_total = getattr(response.usage, "total_tokens", 0)
 
+        # Basic cost estimate (update if pricing changes)
+        # Inputs are unknown granularity here; use total as approximation
+        model_used = response.model or model
+        cost_usd = 0.0
+        try:
+            # Rough pricing based on context guide (per 1M tokens)
+            if "gpt-4o-mini" in model_used:
+                cost_usd = (tokens_total * (0.15 + 0.60) / 2.0) / 1_000_000.0
+            else:
+                cost_usd = (tokens_total * (2.50 + 10.00) / 2.0) / 1_000_000.0
+        except Exception:
+            cost_usd = 0.0
+
         # Cache result
         _set_cached(
             req.message,
-            {"content": content, "model": response.model, "tokens": tokens_total},
+            {
+                "content": content,
+                "model": model_used,
+                "tokens": tokens_total,
+                "cost_usd": round(cost_usd, 6),
+            },
         )
 
         return ChatResponse(
             response=content,
-            model=response.model,
+            model=model_used,
             tokens_used=tokens_total,
             cached=False,
         )

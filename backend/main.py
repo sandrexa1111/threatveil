@@ -1,7 +1,8 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.chat import app as chat_app
+from api.chat import router as chat_router
+from api.vendors import router as vendors_router
 
 
 def create_app() -> FastAPI:
@@ -14,8 +15,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Mount chat sub-app under root (keeps simple structure for MVP)
-    application.mount("/", chat_app)
+    application.include_router(chat_router)
+    application.include_router(vendors_router)
     return application
 
 
